@@ -19,17 +19,12 @@ logs/
 debug.log
 
 # Dataset & large files
-datasets/
 *.csv
 *.h5
 *.npy
 *.npz
 
 # Model checkpoints & training artifacts
-checkpoints/
-*.ckpt
-*.pth
-*.pt
 runs/
 wandb/
 tensorboard/
