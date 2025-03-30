@@ -14,7 +14,6 @@ venv/
 .ipynb_checkpoints/
 
 # Logs & temporary files
-logs/
 *.log
 debug.log
 
