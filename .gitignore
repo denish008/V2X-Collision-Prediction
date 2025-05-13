@@ -18,7 +18,6 @@ venv/
 debug.log
 
 # Dataset & large files
-*.csv
 *.h5
 *.npy
 *.npz

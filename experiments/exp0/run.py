@@ -1,218 +1,289 @@
-import sys
-import os
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-from multiprocessing import cpu_count
-import numpy as np
-from glob import glob
-from typing import List, Union, Literal
+from dataclasses import dataclass, field
+from typing import Optional, Union
 
 import torch
-from torch.utils.data import DataLoader
+from torch import nn
 import lightning.pytorch as lp
-from lightning.pytorch.callbacks import (
-    LearningRateMonitor,
-    ModelCheckpoint,
-    RichModelSummary,
-    RichProgressBar,
-)
-from lightning.pytorch.loggers.csv_logs import CSVLogger
-from lightning.pytorch.loggers.wandb import WandbLogger
-from lightning.pytorch.strategies.ddp import DDPStrategy
-from loguru import logger
-
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from models.lstm import LSTM, LSTMConfig
-from pipelines.experiment import Experiment
-from pipelines.collision_prediction_pipeline import (
-    CollisionDataModule, 
-    CollisionPrediction, 
-    CollisionPredictionConfig
-)
-from datasets.veins_dataset import VeinsDatasetConfig, VeinsDataset
-from constants import column_headers
+from constants import input_dim
 
 
-#====================================================================================#
-
-# Experiment Details
-experiment = Experiment(
-    project="motorcycle_collision_prediction",
-    model_name="lstm_12layer_256hiddim",
-    run_num="run2",
-    notes="""Using LSTM on Scenario A""",
-)
-
-#==================================Preparing Dataset==================================#
-
-# Dataset
-assets_dirpath = "assets"
-assets_filepath = glob(
-    os.path.join(assets_dirpath, "ScenarioA", "*.csv")
-)
-dataset_config = VeinsDatasetConfig(
-    csv_paths=assets_filepath,
-    column_headers=column_headers,
-    timesteps=20,
-    seed=42
-)
-dataset = VeinsDataset(config=dataset_config)
-train_dataset = dataset._get_dataset("train")
-val_dataset = dataset._get_dataset("val")
-test_dataset = dataset._get_dataset("test")
-
-# Dataloaders 
-batch_size = 128
-num_workers = int(cpu_count() * 0.25)
-persistent_workers = False
-prefetch_factor = 2
-pin_memory = True
-
-train_loader = DataLoader(
-    train_dataset, 
-    batch_size=batch_size, 
-    shuffle=True,
-    num_workers=num_workers,
-    persistent_workers=persistent_workers,
-    prefetch_factor=prefetch_factor,
-    pin_memory=pin_memory
-)
-logger.info(f"created train dataloader, batches: {len(train_loader):_}")
-val_loader = DataLoader(
-    val_dataset, 
-    batch_size=batch_size, 
-    shuffle=False,
-    num_workers=num_workers,
-    persistent_workers=persistent_workers,
-    prefetch_factor=prefetch_factor,
-    pin_memory=pin_memory
-)
-logger.info(f"created val dataloader, batches: {len(val_loader):_}")
-test_loader = DataLoader(
-    test_dataset, 
-    batch_size=batch_size, 
-    shuffle=False,
-    num_workers=num_workers,
-    persistent_workers=persistent_workers,
-    prefetch_factor=prefetch_factor,
-    pin_memory=pin_memory
-)
-logger.info(f"created test dataloader, batches: {len(test_loader):_}")
+@dataclass
+class CollisionPredictionConfig:
+    net_config: LSTMConfig 
+    learning_rate: float 
+    net: LSTM
+    lr_scheduler: Optional[str] = None
+    lr_scheduler_params: dict = field(default_factory=dict)
+    total_steps: Optional[int] = None  # Required for OneCycleLR
 
 
-#====================================================================================#
-
-
-def run(experiment, mode: Literal["train", "debug", "predict"]):
-    """
-    Instantiates the training 
-    """
-    #--------------- Trainer:callbacks ---------------# 
-    
-    model_summary = RichModelSummary(max_depth=3)
-    progbar = RichProgressBar(refresh_rate=50)
-    trainer_callbacks = [model_summary, progbar]
-    
-    if mode == "train":
-        model_ckpt = ModelCheckpoint(
-            dirpath=experiment.model_checkpoints_dirpath,
-            every_n_epochs=1,
-            save_on_train_epoch_end=True,
-            save_top_k=-1,
-            save_weights_only=True,
-            save_last=True,
-            auto_insert_metric_name=False,
-            filename="epoch_{epoch}-step_{step}",
+class CollisionPrediction(lp.LightningModule):
+    def __init__(self, pipeline_config):
+        super().__init__()
+        self.pipeline_config = pipeline_config
+        self.net = self.pipeline_config.net(
+            net_config=self.pipeline_config.net_config
         )
-        lr_monitor = LearningRateMonitor(logging_interval="step")
-        trainer_callbacks += [model_ckpt, lr_monitor]
-    elif mode == "debug":
-        logger.info("trainer callbacks are disabled")
+        self.learning_rate = self.pipeline_config.learning_rate
+        self.lr_scheduler = self.pipeline_config.lr_scheduler
+        self.lr_scheduler_params = self.pipeline_config.lr_scheduler_params
+        self.total_steps = self.pipeline_config.total_steps
+        self.criterion = nn.BCELoss()
+        # Add steps_ahead attribute if it doesn't exist (for APT calculation)
+        if not hasattr(self, 'steps_ahead'):
+            self.steps_ahead = 1  # Default value, should be set by the user
 
-    #---------------- Trainer:loggers ----------------# 
-    
-    trainer_loggers = []
-    if mode == "train":
-        wandb_logger = WandbLogger(
-            entity="v2x-collision-project",
-            project=experiment.project,
-            name=experiment.name,
-            notes=experiment.notes,
-            version=experiment.name,
-            resume="never",
-        )
-        csv_logger = CSVLogger(
-            save_dir=experiment.csv_logger_dirpath,
-            name=experiment.name,
-            version=experiment.run_num,
-        )
-        # git_tag_logger = GitTagLogger(
-        #     repo_path=os.path.join(
-        #         user_dirpath,
-        #         <repo_path>,
-        #     ),
-        #     tag_name=experiment.name,
-        #     message=experiment.notes,
-        # )
-        trainer_loggers += [wandb_logger, csv_logger]
+    def forward(self, x):
+        return self.net(x)
 
-    max_epochs = 100
-    total_steps = (len(train_loader) * max_epochs)
-    trainer = lp.Trainer(
-        max_epochs=max_epochs,
-        precision="32",
-        accelerator="gpu",
-        devices="auto",
-        logger=trainer_loggers,
-        callbacks=trainer_callbacks,
-        num_sanity_val_steps=4,
-        benchmark=True,
-        enable_checkpointing=(False if mode == "debug" else None),
-        log_every_n_steps=100,
-        sync_batchnorm=True,
-        strategy=DDPStrategy(find_unused_parameters=False),
-        detect_anomaly=False
-    )
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = self.criterion(y_hat, y)
+        
+        # Log training loss with 'train' prefix
+        self.log('train/loss', loss, 
+                 on_step=True,
+                 on_epoch=True,
+                 prog_bar=True,
+                 sync_dist=True)
+        
+        return loss
 
-    pipeline_config = CollisionPredictionConfig(
-        net=LSTM,
-        net_config=LSTMConfig(
-            input_dim=9,
-            hidden_dim=256, # 64 
-            num_layers=12,  # 3
-            output_dim=1,
-            dropout_prob=0.3
-        ),    
-        learning_rate=1e-4,
-        lr_scheduler="onecycle",
-        total_steps=total_steps
-    )
-    model = CollisionPrediction(
-        pipeline_config=pipeline_config
-    )
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = self.criterion(y_hat, y)
+        
+        # Predict and calculate metrics
+        predicted = (y_hat > 0.5).float()
+        y_true = y.cpu().numpy().flatten().tolist()
+        y_pred = predicted.cpu().numpy().flatten().tolist()
 
-    checkpoint_filepath = None
-    if checkpoint_filepath is not None and os.path.exists(checkpoint_filepath):
-        logger.info(f"{'_'*10} checkpoint : {checkpoint_filepath} {'_'*10}")
-        model = model.load_from_checkpoint(
-            checkpoint_path=checkpoint_filepath, config=pipeline_config
-        )
-    else:
-        logger.info( f"{'_'*10} loading model without checkpoint {'_'*10}")
-    
-    logger.info("created model")
-    
-    data_module = CollisionDataModule(train_loader, val_loader, test_loader)
-    trainer.fit(
-        model=model,
-        datamodule = data_module 
-    )
+        # Calculate validation metrics with safe handling
+        accuracy = accuracy_score(y_true, y_pred)
+        
+        # Handle cases where metrics may be undefined
+        try:
+            precision = precision_score(y_true, y_pred, zero_division=0)
+            recall = recall_score(y_true, y_pred, zero_division=0)
+            f1 = f1_score(y_true, y_pred, zero_division=0)
+        except Exception as e:
+            self.log('val/metric_error', 1.0, sync_dist=True)
+            precision, recall, f1 = 0.0, 0.0, 0.0
+        
+        # Log validation metrics with 'val' prefix
+        self.log('val/loss', loss, sync_dist=True)
+        self.log('val/accuracy', accuracy, sync_dist=True)
+        self.log('val/precision', precision, sync_dist=True)
+        self.log('val/recall', recall, sync_dist=True)
+        self.log('val/f1', f1, sync_dist=True)
+
+        return {
+            'val_loss': loss,
+            'val_accuracy': accuracy,
+            'val_precision': precision,
+            'val_recall': recall,
+            'val_f1': f1
+        }
+
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        predicted = (y_hat > 0.5).float()
+        y_true = y.cpu().numpy().flatten().tolist()
+        y_pred = predicted.cpu().numpy().flatten().tolist()
+
+        # Calculate test metrics with safe handling
+        accuracy = accuracy_score(y_true, y_pred)
+        
+        # Handle cases where metrics may be undefined using zero_division parameter
+        try:
+            precision = precision_score(y_true, y_pred, zero_division=0)
+            recall = recall_score(y_true, y_pred, zero_division=0)
+            f1 = f1_score(y_true, y_pred, zero_division=0)
+        except Exception as e:
+            self.log('test/metric_error', 1.0, sync_dist=True)
+            precision, recall, f1 = 0.0, 0.0, 0.0
+
+        # True Positives (TP) and False Positives (FP)
+        TP = sum([(1 if (ypred == ytrue == 1) else 0) for ypred, ytrue in zip(y_pred, y_true)])
+        FP = sum([(1 if (ypred == 1 and ytrue == 0) else 0) for ypred, ytrue in zip(y_pred, y_true)])
+
+        # Collision Prediction metrics with safe division
+        predicted_collisions = sum(y_pred)
+        total_collisions = sum(y_true)
+        
+        # Handle potential zero division cases
+        CPP = predicted_collisions / total_collisions if total_collisions else 0
+        CDP = predicted_collisions / (FP + total_collisions) if (FP + total_collisions) else 0
+        
+        # Average Prediction Time (APT) with safe division
+        average_prediction_time = self.steps_ahead * predicted_collisions
+        APT = average_prediction_time / total_collisions if total_collisions else 0
+
+        # Log test metrics with 'test' prefix
+        self.log('test/accuracy', accuracy, sync_dist=True)
+        self.log('test/precision', precision, sync_dist=True)
+        self.log('test/recall', recall, sync_dist=True)
+        self.log('test/f1', f1, sync_dist=True)
+        self.log('test/cpp', CPP, sync_dist=True)
+        self.log('test/cdp', CDP, sync_dist=True)
+        self.log('test/apt', APT, sync_dist=True)
+        
+        # Log additional information about the data distribution
+        self.log('test/total_predictions', len(y_pred), sync_dist=True)
+        self.log('test/positive_predictions', predicted_collisions, sync_dist=True)
+        self.log('test/actual_positives', total_collisions, sync_dist=True)
+
+        return {
+            'test_accuracy': accuracy,
+            'test_precision': precision,
+            'test_recall': recall,
+            'test_f1': f1,
+            'test_cpp': CPP,
+            'test_cdp': CDP,
+            'test_apt': APT
+        }
+
+    def configure_optimizers(self):
+        # Create optimizer
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+
+        # If no scheduler is specified, return just the optimizer
+        if not self.lr_scheduler:
+            return optimizer
+
+        # OneCycleLR scheduler
+        if self.lr_scheduler == 'onecycle':
+            from torch.optim.lr_scheduler import OneCycleLR
+            
+            # Default parameters if not provided
+            default_params = {
+                'max_lr': self.learning_rate * 3,
+                'total_steps': self.total_steps,
+                'pct_start': 0.3,
+                'div_factor': 25,
+                'final_div_factor': 1e4
+            }
+            
+            # Merge default params with user-provided params
+            scheduler_params = {**default_params, **self.lr_scheduler_params}
+            
+            # Validate total_steps is provided for OneCycleLR
+            if scheduler_params.get('total_steps') is None:
+                raise ValueError("total_steps must be provided for OneCycleLR scheduler")
+            
+            scheduler = OneCycleLR(
+                optimizer, 
+                **scheduler_params
+            )
+            
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {
+                    'scheduler': scheduler,
+                    'interval': 'step',
+                    'frequency': 1
+                }
+            }
+        
+        # Cosine annealing with warmup
+        elif self.lr_scheduler == 'cosine_warmup':
+            from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+            
+            # Default parameters if not provided
+            default_params = {
+                'T_0': 10,
+                'T_mult': 2,
+                'eta_min': 1e-6
+            }
+            
+            # Merge default params with user-provided params
+            scheduler_params = {**default_params, **self.lr_scheduler_params}
+            
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer, 
+                **scheduler_params
+            )
+            
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {
+                    'scheduler': scheduler,
+                    'interval': 'epoch',
+                    'frequency': 1
+                }
+            }
+        
+        # Step scheduler
+        elif self.lr_scheduler == 'step':
+            from torch.optim.lr_scheduler import StepLR
+            
+            # Default parameters if not provided
+            default_params = {
+                'step_size': 10,
+                'gamma': 0.1
+            }
+            
+            # Merge default params with user-provided params
+            scheduler_params = {**default_params, **self.lr_scheduler_params}
+            
+            scheduler = StepLR(optimizer, **scheduler_params)
+            
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {
+                    'scheduler': scheduler,
+                    'interval': 'epoch',
+                    'frequency': 1
+                }
+            }
+        
+        # Exponential scheduler
+        elif self.lr_scheduler == 'exponential':
+            from torch.optim.lr_scheduler import ExponentialLR
+            
+            # Default parameters if not provided
+            default_params = {
+                'gamma': 0.95
+            }
+            
+            # Merge default params with user-provided params
+            scheduler_params = {**default_params, **self.lr_scheduler_params}
+            
+            scheduler = ExponentialLR(optimizer, **scheduler_params)
+            
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {
+                    'scheduler': scheduler,
+                    'interval': 'epoch',
+                    'frequency': 1
+                }
+            }
+        
+        # If an unsupported scheduler is specified
+        raise ValueError(f"Unsupported learning rate scheduler: {self.lr_scheduler}")
+        
+
+#================================ Data Module ================================#
 
 
-#====================================================================================#
+class CollisionDataModule(lp.LightningDataModule):
+    def __init__(self, train_loader, val_loader, test_loader):
+        super().__init__()
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
 
+    def train_dataloader(self):
+        return self.train_loader
 
-if __name__ == "__main__":
-    mode = "debug"
-    logger.info(f"Running {experiment.name=} in {mode=}")
-    run(experiment, mode=mode)
+    def val_dataloader(self):
+        return self.val_loader
+
+    def test_dataloader(self):
+        return self.test_loader
